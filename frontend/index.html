@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>DDR AI — Detailed Diagnostic Report Generator</title>
+  <meta name="description" content="AI-powered system that converts raw site inspection data into structured, client-ready Detailed Diagnostic Reports."/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Playfair+Display:wght@700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+  <!-- ── NAV ──────────────────────────────────────── -->
+  <nav class="navbar">
+    <div class="nav-inner">
+      <div class="nav-logo">
+        <span class="logo-icon">📋</span>
+        <span class="logo-text">DDR <span class="logo-ai">AI</span></span>
+      </div>
+      <div class="nav-links">
+        <a href="#how-it-works">How It Works</a>
+        <a href="#upload-section" class="nav-cta">Generate Report</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ── HERO ─────────────────────────────────────── -->
+  <section class="hero">
+    <div class="hero-glow"></div>
+    <div class="hero-content">
+      <div class="hero-badge">🤖 AI-Powered · Inspection Intelligence</div>
+      <h1 class="hero-title">
+        Transform Inspection Data<br/>
+        into <span class="gradient-text">Client-Ready Reports</span>
+      </h1>
+      <p class="hero-subtitle">
+        Upload your site inspection report and thermal images — our AI reads, merges, 
+        and structures the data into a professional Detailed Diagnostic Report (DDR) in minutes.
+      </p>
+      <div class="hero-cta-group">
+        <a href="#upload-section" class="btn-primary">Generate DDR Report →</a>
+        <a href="#how-it-works" class="btn-ghost">See How It Works</a>
+      </div>
+    </div>
+
+    <!-- Features grid -->
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🔍</div>
+        <div class="feature-title">Smart Extraction</div>
+        <div class="feature-desc">Pulls text and images from both PDFs intelligently</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🌡</div>
+        <div class="feature-title">Thermal Analysis</div>
+        <div class="feature-desc">Correlates thermal readings with visual observations</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">⚡</div>
+        <div class="feature-title">AI Merge & Dedupe</div>
+        <div class="feature-desc">Eliminates duplicates, flags conflicts intelligently</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📄</div>
+        <div class="feature-title">Professional Output</div>
+        <div class="feature-desc">Client-ready HTML + PDF with embedded images</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── HOW IT WORKS ──────────────────────────────── -->
+  <section class="how-section" id="how-it-works">
+    <div class="section-label">The Process</div>
+    <h2 class="section-title">How the AI Pipeline Works</h2>
+    <div class="steps-grid">
+      <div class="step">
+        <div class="step-num">01</div>
+        <div class="step-title">Upload Documents</div>
+        <div class="step-desc">Upload your Inspection Report PDF and Thermal Report PDF</div>
+      </div>
+      <div class="step-arrow">→</div>
+      <div class="step">
+        <div class="step-num">02</div>
+        <div class="step-title">AI Extraction</div>
+        <div class="step-desc">Gemini AI extracts text, readings, and images from both</div>
+      </div>
+      <div class="step-arrow">→</div>
+      <div class="step">
+        <div class="step-num">03</div>
+        <div class="step-title">Intelligent Merge</div>
+        <div class="step-desc">Data is merged, deduplicated, and structured per area</div>
+      </div>
+      <div class="step-arrow">→</div>
+      <div class="step">
+        <div class="step-num">04</div>
+        <div class="step-title">Download DDR</div>
+        <div class="step-desc">Get your professional report as HTML or PDF</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── UPLOAD SECTION ───────────────────────────── -->
+  <section class="upload-section" id="upload-section">
+    <div class="section-label">Generate Your Report</div>
+    <h2 class="section-title">Upload Inspection Documents</h2>
+    <p class="section-sub">Both files must be PDF format. Processing typically takes 1–3 minutes.</p>
+
+    <div class="upload-card" id="upload-card">
+      <form id="upload-form">
+
+        <!-- API Key input -->
+        <div class="api-key-row">
+          <div class="api-key-label">
+            <span>🔑</span>
+            <div>
+              <div class="api-key-title">Gemini API Key</div>
+              <div class="api-key-sub">Get a free key at <a href="https://aistudio.google.com" target="_blank">aistudio.google.com</a></div>
+            </div>
+          </div>
+          <input
+            type="password"
+            id="api-key-input"
+            class="api-key-input"
+            placeholder="AIza..."
+            autocomplete="off"
+          />
+        </div>
+
+        <!-- File drops -->
+        <div class="uploads-row">
+          <!-- Inspection PDF -->
+          <div class="drop-zone" id="dz-inspection" ondrop="handleDrop(event,'inspection')" ondragover="handleDragover(event)" ondragleave="removeDragOver(event)">
+            <input type="file" id="inspection-file" accept=".pdf" hidden onchange="handleFileSelect(this, 'inspection')"/>
+            <div class="dz-icon">📊</div>
+            <div class="dz-title">Inspection Report</div>
+            <div class="dz-sub">Drop PDF here or <span class="dz-link" onclick="document.getElementById('inspection-file').click()">browse</span></div>
+            <div class="dz-file-name" id="inspection-fname" style="display:none;"></div>
+          </div>
+
+          <!-- Thermal PDF -->
+          <div class="drop-zone" id="dz-thermal" ondrop="handleDrop(event,'thermal')" ondragover="handleDragover(event)" ondragleave="removeDragOver(event)">
+            <input type="file" id="thermal-file" accept=".pdf" hidden onchange="handleFileSelect(this, 'thermal')"/>
+            <div class="dz-icon">🌡</div>
+            <div class="dz-title">Thermal Report</div>
+            <div class="dz-sub">Drop PDF here or <span class="dz-link" onclick="document.getElementById('thermal-file').click()">browse</span></div>
+            <div class="dz-file-name" id="thermal-fname" style="display:none;"></div>
+          </div>
+        </div>
+
+        <button type="submit" class="generate-btn" id="generate-btn" disabled>
+          <span class="btn-text">⚡ Generate DDR Report</span>
+        </button>
+      </form>
+    </div>
+
+    <!-- ── PROGRESS ──────────────────────── -->
+    <div class="progress-card" id="progress-card" style="display:none;">
+      <div class="progress-header">
+        <div class="progress-spinner" id="progress-spinner"></div>
+        <div class="progress-info">
+          <div class="progress-title" id="progress-title">Starting pipeline...</div>
+          <div class="progress-sub" id="progress-sub">Please wait</div>
+        </div>
+        <div class="progress-pct" id="progress-pct">0%</div>
+      </div>
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progress-bar"></div>
+      </div>
+      <div class="progress-steps" id="progress-steps">
+        <div class="ps" id="ps-extract">📄 Extracting PDFs</div>
+        <div class="ps" id="ps-ai">🤖 AI Analysis</div>
+        <div class="ps" id="ps-merge">🔗 Merging Data</div>
+        <div class="ps" id="ps-render">✨ Rendering Report</div>
+      </div>
+    </div>
+
+    <!-- ── RESULT ──────────────────────── -->
+    <div class="result-card" id="result-card" style="display:none;">
+      <div class="result-icon">✅</div>
+      <div class="result-title">Your DDR Report is Ready!</div>
+      <div class="result-sub">Download your professionally structured report below.</div>
+      <div class="result-actions">
+        <a class="btn-download" id="btn-preview" href="#" target="_blank">🔎 View Report</a>
+        <a class="btn-download btn-secondary" id="btn-download-html" href="#" download>⬇ Download HTML</a>
+        <a class="btn-download btn-pdf" id="btn-download-pdf" href="#">⬇ Download PDF</a>
+      </div>
+      <button class="btn-reset" onclick="resetForm()">← Generate Another Report</button>
+    </div>
+
+    <!-- ── ERROR ──────────────────────── -->
+    <div class="error-card" id="error-card" style="display:none;">
+      <div class="error-icon">❌</div>
+      <div class="error-title">Generation Failed</div>
+      <div class="error-msg" id="error-msg"></div>
+      <button class="btn-reset" onclick="resetForm()">← Try Again</button>
+    </div>
+  </section>
+
+  <!-- ── FOOTER ───────────────────────────────────── -->
+  <footer class="footer">
+    <div class="footer-logo">📋 DDR AI System</div>
+    <div class="footer-text">AI-powered building inspection report generator.<br/>Uses Gemini 1.5 Flash for intelligent data extraction and merging.</div>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
