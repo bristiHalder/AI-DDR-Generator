@@ -1,12 +1,9 @@
 FROM python:3.11-slim
 
-# System dependencies for PDF processing
+# System dependencies for PDF processing (Playwright headless browser)
 RUN apt-get update && apt-get install -y \
-    libpango-1.0-0 \
-    libpangoft2-1.0-0 \
-    libgdk-pixbuf2.0-0 \
-    libffi-dev \
-    shared-mime-info \
+    wget \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -14,6 +11,10 @@ WORKDIR /app
 # Copy requirements first for layer caching
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright and its Chromium dependencies
+RUN playwright install chromium
+RUN playwright install-deps chromium
 
 # Copy all source files
 COPY backend/ ./backend/
