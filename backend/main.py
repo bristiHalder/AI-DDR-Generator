@@ -5,9 +5,17 @@ Handles file uploads, runs the AI pipeline, and serves generated reports.
 
 import json
 import os
+import sys
 import uuid
 import asyncio
+import concurrent.futures
 from pathlib import Path
+
+# Force UTF-8 output on Windows (prevents charmap encode errors from Unicode in logs/docstrings)
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +29,7 @@ load_dotenv()
 
 # Import pipeline modules
 from pipeline.pdf_extractor import extract_pdf
-from pipeline.ai_processor import extract_inspection_data, extract_thermal_data, generate_ddr_json
+from pipeline.ai_processor import generate_ddr_direct
 from pipeline.report_builder import build_final_report
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
@@ -57,6 +65,9 @@ if FRONTEND_DIR.exists():
 # In-memory job status store
 jobs: dict[str, dict] = {}
 
+# Shared thread pool — reused across all jobs for efficiency
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+
 
 # ── Utility ────────────────────────────────────────────────────────────────────
 
@@ -77,74 +88,102 @@ async def save_upload(upload_file: UploadFile, dest: Path) -> None:
 
 # ── Background Pipeline ────────────────────────────────────────────────────────
 
-def run_pipeline(job_id: str, inspection_path: str, thermal_path: str):
+def run_pipeline(job_id: str, inspection_path: str, thermal_path: str, api_key: str, provider: str = "gemini"):
     """
-    Full DDR generation pipeline (runs in background thread).
-    Updates jobs[job_id] with progress and results.
+    Full DDR generation pipeline.
+
+    Timeline (typical with paid key):
+      ~5s   PDF extraction  (parallel)
+      ~15s  AI extraction   (parallel - both docs at once)
+      ~10s  AI merge
+      ~2s   HTML render
+      -----------------
+      ~32s  total
     """
+    import time as _time
+    t0 = _time.time()
+
+    def _tick(label: str) -> None:
+        print(f"[pipeline] {label} | {_time.time()-t0:.1f}s elapsed")
+
+    def _set(status: str, pct: int, msg: str) -> None:
+        jobs[job_id].update({"status": status, "progress": pct, "message": msg})
+
     try:
-        jobs[job_id]["status"] = "extracting_pdfs"
-        jobs[job_id]["progress"] = 10
-        jobs[job_id]["message"] = "Extracting text and images from PDFs..."
+        # ── STEP 1: Extract both PDFs in parallel (no API cost) ───────────
+        _set("extracting_pdfs", 15, "Reading and extracting both PDFs...")
+        _tick("PDF extraction start")
 
-        inspection_data = extract_pdf(inspection_path)
-        thermal_data = extract_pdf(thermal_path)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fi = pool.submit(extract_pdf, inspection_path)
+            ft = pool.submit(extract_pdf, thermal_path)
+            inspection_data = fi.result()
+            thermal_data    = ft.result()
 
-        jobs[job_id]["status"] = "ai_extraction"
-        jobs[job_id]["progress"] = 35
-        jobs[job_id]["message"] = "AI is analyzing the inspection report..."
+        _tick(f"PDF done: insp={inspection_data['total_pages']}p/{len(inspection_data['all_images'])}imgs  therm={thermal_data['total_pages']}p/{len(thermal_data['all_images'])}imgs")
 
-        inspection_structured = extract_inspection_data(inspection_data["full_text"])
+        # ── STEP 2: ONE LLM call generates the complete DDR ───────────────
+        # (Previously 3 calls — now 1, saving 67% of API quota)
+        _set("ai_extraction", 40, "AI reading both documents and generating DDR...")
+        _tick("Single LLM call start")
 
-        jobs[job_id]["progress"] = 55
-        jobs[job_id]["message"] = "AI is analyzing the thermal report..."
+        ddr_json = generate_ddr_direct(
+            inspection_data["full_text"],
+            thermal_data["full_text"],
+            api_key=api_key,
+            provider=provider,
+        )
 
-        thermal_structured = extract_thermal_data(thermal_data["full_text"])
+        _tick("LLM call done")
 
-        jobs[job_id]["status"] = "generating_ddr"
-        jobs[job_id]["progress"] = 70
-        jobs[job_id]["message"] = "Merging data and generating DDR..."
-
-        ddr_json = generate_ddr_json(inspection_structured, thermal_structured)
-
-        jobs[job_id]["status"] = "assembling_report"
-        jobs[job_id]["progress"] = 85
-        jobs[job_id]["message"] = "Assembling final report with images..."
+        # ── STEP 3: Assign images + render HTML ───────────────────────────
+        _set("assembling_report", 82, "Embedding images and rendering report...")
 
         final_report = build_final_report(ddr_json, inspection_data, thermal_data)
 
-        # Save JSON output
-        json_path = OUTPUTS_DIR / f"{job_id}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(final_report, f, indent=2, ensure_ascii=False)
-
-        # Render HTML
         html_content = render_html_report(final_report)
-        html_path = OUTPUTS_DIR / f"{job_id}.html"
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
+        html_path    = OUTPUTS_DIR / f"{job_id}.html"
+        html_path.write_text(html_content, encoding="utf-8")
 
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["progress"] = 100
-        jobs[job_id]["message"] = "DDR Report generated successfully!"
-        jobs[job_id]["report_id"] = job_id
+        # Lean JSON without large base64 blobs (those live in the HTML)
+        json_safe = {k: v for k, v in final_report.items() if k != "area_observations"}
+        json_safe["area_observations"] = [
+            {k2: v2 for k2, v2 in area.items()
+             if k2 not in ("assigned_images", "assigned_thermal_images")}
+            for area in final_report.get("area_observations", [])
+        ]
+        (OUTPUTS_DIR / f"{job_id}.json").write_text(
+            json.dumps(json_safe, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        jobs[job_id].update({
+            "status":    "completed",
+            "progress":  100,
+            "message":   "DDR Report generated successfully!",
+            "report_id": job_id,
+        })
+        _tick("DONE")
 
     except Exception as e:
-        err_str = str(e)
-        # Provide a clear, actionable message for quota errors
-        if "QUOTA_EXHAUSTED" in err_str or "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
+        err = str(e)
+        if "Invalid Gemini API key" in err or "API_KEY_INVALID" in err:
             user_msg = (
-                "⚠️ Gemini API quota exhausted. "
-                "The free tier allows ~1,500 tokens/minute and limited daily requests. "
-                "Solutions: (1) Wait ~60 seconds and retry, (2) Try again tomorrow when quota resets, "
-                "or (3) Upgrade to a paid Gemini API key at https://aistudio.google.com/"
+                "Invalid API key. Please check the key you entered and try again. "
+                "Get a valid key at https://aistudio.google.com/apikey"
+            )
+        elif "QUOTA_EXHAUSTED" in err or "RESOURCE_EXHAUSTED" in err or "429" in err:
+            user_msg = (
+                "Gemini API quota hit. The free tier has daily limits. "
+                "Try: (1) wait 60s and retry, (2) try tomorrow when quota resets, "
+                "or (3) use a paid key at https://aistudio.google.com/"
             )
         else:
-            user_msg = f"Pipeline failed: {err_str}"
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["progress"] = 0
-        jobs[job_id]["message"] = user_msg
-        print(f"[ERROR] Job {job_id} failed: {e}")
+            user_msg = f"Pipeline failed: {err}"
+
+        jobs[job_id].update({"status": "failed", "progress": 0, "message": user_msg})
+        print(f"[ERROR] Job {job_id} provider={provider}: {err}")
+
+
 
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
@@ -163,17 +202,32 @@ async def generate_report(
     background_tasks: BackgroundTasks,
     inspection_report: UploadFile = File(..., description="Site Inspection Report PDF"),
     thermal_report: UploadFile = File(..., description="Thermal Images Report PDF"),
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+    x_gemini_key:   Optional[str] = Header(None, alias="X-Gemini-Key"),
+    x_api_key:      Optional[str] = Header(None, alias="X-Api-Key"),
+    x_ai_provider:  Optional[str] = Header(None, alias="X-AI-Provider"),
 ):
     """
     Upload two PDFs and kick off the DDR generation pipeline.
+    Supports multiple AI providers via X-AI-Provider header:
+      gemini     -- Google Gemini (needs X-Gemini-Key or X-Api-Key)
+      groq       -- Groq Cloud   (needs X-Api-Key, free at console.groq.com)
+      ollama     -- Local Ollama (no key needed)
+      openrouter -- OpenRouter   (needs X-Api-Key)
     Returns a job_id to poll for status.
     """
-    # Configure Gemini with key from header (fallback to env)
-    api_key = x_gemini_key or os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="Gemini API key is required. Set GEMINI_API_KEY in .env or pass X-Gemini-Key header.")
-    os.environ["GEMINI_API_KEY"] = api_key  # propagate to pipeline modules (google-genai picks up env var)
+    provider = (x_ai_provider or os.getenv("PROVIDER", "gemini")).lower().strip()
+
+    # Resolve API key based on provider
+    if provider == "ollama":
+        api_key = ""  # Ollama is local, no key needed
+    else:
+        api_key = x_api_key or x_gemini_key or os.getenv("GEMINI_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"API key required for provider '{provider}'. "
+                       "Pass it via the X-Api-Key header or set it in backend/.env"
+            )
 
     # Validate file types
     for f in [inspection_report, thermal_report]:
@@ -196,16 +250,16 @@ async def generate_report(
         "report_id": None,
     }
 
-    # Run pipeline in background thread (avoids blocking the async event loop)
-    import concurrent.futures
+    # Run pipeline in shared thread pool (non-blocking)
     loop = asyncio.get_event_loop()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     loop.run_in_executor(
-        executor,
+        _EXECUTOR,
         run_pipeline,
         job_id,
         str(inspection_path),
         str(thermal_path),
+        api_key,    # passed explicitly -- thread-safe
+        provider,   # gemini / groq / ollama / openrouter
     )
 
     return JSONResponse({"job_id": job_id, "message": "Pipeline started"})
@@ -250,14 +304,25 @@ async def download_pdf(job_id: str):
     if not html_path.exists():
         raise HTTPException(status_code=404, detail="Report not generated yet")
 
-    # Convert HTML → PDF using xhtml2pdf (works on Windows without GTK)
+    # Convert HTML → PDF using Playwright (pixel-perfect modern CSS rendering)
     try:
-        from xhtml2pdf import pisa
-        html_content = html_path.read_text(encoding="utf-8")
-        with open(pdf_path, "wb") as pdf_file:
-            pisa_status = pisa.CreatePDF(html_content, dest=pdf_file)
-        if pisa_status.err:
-            raise RuntimeError("xhtml2pdf conversion error")
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            
+            # Load the local HTML file into the headless browser
+            file_url = f"file:///{html_path.resolve().as_posix()}"
+            await page.goto(file_url, wait_until="networkidle")
+            
+            # Generate a gorgeous, styled PDF
+            await page.pdf(
+                path=str(pdf_path),
+                format="A4",
+                print_background=True,
+                margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"}
+            )
+            await browser.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF conversion failed: {e}")
 
@@ -274,6 +339,6 @@ async def health_check():
     api_key = os.getenv("GEMINI_API_KEY", "")
     return {
         "status": "healthy",
-        "gemini_configured": bool(api_key),
+        "gemini_configured": bool(api_key and api_key != "your_gemini_api_key_here"),
         "active_jobs": len(jobs),
     }

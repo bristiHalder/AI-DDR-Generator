@@ -1,13 +1,15 @@
+# -*- coding: utf-8 -*-
 """
-ai_processor.py
-Uses Google Gemini to extract structured data from inspection documents
-and merge them into a unified DDR JSON structure.
+ai_processor.py  -- Multi-provider LLM support for DDR generation.
 
-Key design choices:
-- Model fallback: gemini-1.5-flash → gemini-1.5-flash-8b → gemini-1.0-pro
-- Smart text trimming to stay well within free-tier token limits
-- Exponential backoff on 429 rate-limit errors
-- Robust JSON extraction from messy LLM responses
+Supported providers (set PROVIDER in .env or pass via UI):
+  gemini   -- Google Gemini (gemini-2.0-flash)         [default]
+  groq     -- Groq Cloud    (llama-3.3-70b-versatile)  [free, fast, recommended]
+  ollama   -- Local Ollama  (llama3 / mistral)          [fully offline, no limits]
+  openrouter -- OpenRouter  (free credits on signup)
+
+Single-call design: ONE LLM call per run -> complete DDR JSON.
+API key passed explicitly as function arg (thread-safe).
 """
 
 import json
@@ -16,358 +18,369 @@ import re
 import time
 from typing import Any
 
-from google import genai
-from google.genai import types
 
-# ── Model priority list (cheapest / fastest first) ────────────────────────────
-# gemini-1.5-flash-8b has the HIGHEST free-tier quotas → try it first
-# Falls through to flash, then pro if rate limited
-MODEL_PRIORITY = [
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-pro",
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+# Default provider -- can be overridden by PROVIDER env var or UI selection
+DEFAULT_PROVIDER = os.getenv("PROVIDER", "gemini").lower()
+
+# Max chars sent per document (~750 tokens each)
+MAX_DOC_CHARS = 3_000
+
+# Ollama local endpoint
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3")
+
+# Groq models (in order of preference)
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",   # best quality, generous free tier
+    "llama-3.1-8b-instant",      # faster, smaller
+    "mixtral-8x7b-32768",        # good for long context
 ]
 
-# ── Max chars sent to LLM ─────────────────────────────────────────────────────
-# ~4 chars/token → 6000 chars ≈ 1500 tokens. Very safe for free tier.
-# The PDFs are large but we extract the key info in the first/last sections.
-MAX_TEXT_CHARS = 6_000
+# Gemini models (2.x only -- 1.5 is retired)
+GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+]
 
 
-def _get_client() -> genai.Client:
-    """Return a configured Gemini client."""
-    api_key = os.getenv("GEMINI_API_KEY", "")
+# ---------------------------------------------------------------------------
+# Provider implementations
+# ---------------------------------------------------------------------------
+
+def _call_gemini(prompt: str, api_key: str) -> str:
+    """Call Google Gemini API."""
+    from google import genai
+    from google.genai import types
+
     if not api_key or api_key == "your_gemini_api_key_here":
         raise RuntimeError(
-            "GEMINI_API_KEY is not set. "
-            "Add your key to backend/.env or enter it in the UI."
+            "Gemini API key not set. Enter it in the UI or add GEMINI_API_KEY to .env"
         )
-    return genai.Client(api_key=api_key)
 
+    cl = genai.Client(api_key=api_key)
 
-def _call_llm(prompt: str, retries: int = 2) -> str:
-    """
-    Call Gemini with model fallback and exponential back-off on rate limits.
-    Returns the raw text response.
-    """
-    client = _get_client()
+    for model in GEMINI_MODELS:
+        try:
+            resp = cl.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=4096,
+                ),
+            )
+            print(f"[llm] OK  gemini/{model}")
+            return resp.text
 
-    for model in MODEL_PRIORITY:
-        for attempt in range(retries):
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=4096,
-                    ),
+        except Exception as exc:
+            s = str(exc)
+            if "API_KEY_INVALID" in s or "API key not valid" in s:
+                raise RuntimeError(
+                    "Invalid Gemini API key. Get one at https://aistudio.google.com/apikey"
                 )
-                print(f"[ai_processor] ✅ Success with model={model} attempt={attempt+1}")
-                return response.text
-
-            except Exception as e:
-                err_str = str(e)
-                is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
-                is_daily = "free_tier_requests" in err_str and "limit: 0" in err_str
-                is_last_attempt = attempt == retries - 1
-
-                if is_daily:
-                    # Daily quota completely exhausted — skip immediately to next model
-                    print(f"[ai_processor] ❌ Daily quota exhausted on {model}. Trying next model immediately.")
-                    break
-                elif is_quota:
-                    wait = 20 * (2 ** attempt)   # 20s, 40s
-                    print(
-                        f"[ai_processor] ⚠️  Rate limit on {model} attempt {attempt+1}. "
-                        f"Waiting {wait}s..."
-                    )
-                    if not is_last_attempt:
-                        time.sleep(wait)
-                    else:
-                        print(f"[ai_processor] ❌ Giving up on {model}, trying next model.")
-                        break
-                else:
-                    wait = 5 * (attempt + 1)
-                    print(f"[ai_processor] ⚠️  Error on {model}: {e}. Waiting {wait}s...")
-                    if not is_last_attempt:
-                        time.sleep(wait)
-                    else:
-                        print(f"[ai_processor] ❌ Non-quota error, trying next model.")
-                        break
+            if "404" in s or "NOT_FOUND" in s:
+                print(f"[llm] SKIP gemini/{model}: not found")
+                continue
+            if ("limit: 0" in s or "free_tier" in s) and ("429" in s or "RESOURCE_EXHAUSTED" in s):
+                print(f"[llm] SKIP gemini/{model}: daily quota = 0")
+                continue
+            if "429" in s or "RESOURCE_EXHAUSTED" in s:
+                print(f"[llm] WAIT gemini/{model}: rate limited, waiting 15s")
+                time.sleep(15)
+                continue
+            print(f"[llm] ERR  gemini/{model}: {s[:150]}")
+            continue
 
     raise RuntimeError(
-        "QUOTA_EXHAUSTED: All Gemini models have hit their daily free-tier quota. "
-        "Please wait until quota resets (midnight PT) or upgrade your Google AI API key to a paid plan at https://aistudio.google.com/"
+        "QUOTA_EXHAUSTED: All Gemini models unavailable. "
+        "Switch to Groq (free) or Ollama (local). See README."
     )
 
 
-def _trim_text(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
+def _call_groq(prompt: str, api_key: str) -> str:
+    """Call Groq Cloud API (free tier: 14,400 req/day, very fast)."""
+    try:
+        from groq import Groq
+    except ImportError:
+        raise RuntimeError(
+            "groq package not installed. Run: pip install groq"
+        )
+
+    if not api_key or api_key == "your_groq_key_here":
+        raise RuntimeError(
+            "Groq API key not set. "
+            "Get a FREE key at https://console.groq.com (no credit card needed)"
+        )
+
+    client = Groq(api_key=api_key)
+
+    for model in GROQ_MODELS:
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=4096,
+            )
+            result = completion.choices[0].message.content
+            print(f"[llm] OK  groq/{model}")
+            return result
+
+        except Exception as exc:
+            s = str(exc)
+            if "invalid_api_key" in s.lower() or "401" in s:
+                raise RuntimeError(
+                    "Invalid Groq API key. Get one free at https://console.groq.com"
+                )
+            if "rate_limit" in s.lower() or "429" in s:
+                print(f"[llm] WAIT groq/{model}: rate limited, trying next model")
+                continue
+            if "model_not_found" in s.lower() or "404" in s:
+                print(f"[llm] SKIP groq/{model}: model not found")
+                continue
+            print(f"[llm] ERR  groq/{model}: {s[:150]}")
+            continue
+
+    raise RuntimeError("All Groq models failed. Check your API key at https://console.groq.com")
+
+
+def _call_ollama(prompt: str, model: str = None) -> str:
     """
-    Intelligently trim document text to stay within token limits.
-    Keeps the first 60% and last 40% to preserve both header info and body.
+    Call local Ollama instance (no API key needed, runs fully offline).
+    Install: https://ollama.com  then run: ollama pull llama3
     """
-    if len(text) <= max_chars:
+    import urllib.request
+    import urllib.error
+
+    model = model or OLLAMA_MODEL
+    url   = f"{OLLAMA_BASE_URL}/api/generate"
+    data  = json.dumps({
+        "model":  model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": 4096},
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            text = result.get("response", "")
+            print(f"[llm] OK  ollama/{model}")
+            return text
+    except urllib.error.URLError:
+        raise RuntimeError(
+            "Cannot connect to Ollama. Make sure Ollama is running: "
+            "1) Install from https://ollama.com  "
+            "2) Run: ollama serve  "
+            "3) Pull a model: ollama pull llama3"
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Ollama error: {exc}")
+
+
+def _call_openrouter(prompt: str, api_key: str) -> str:
+    """Call OpenRouter (aggregates many free/cheap models)."""
+    try:
+        import urllib.request
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        data = json.dumps({
+            "model": "meta-llama/llama-3.1-8b-instruct:free",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            return result["choices"][0]["message"]["content"]
+    except Exception as exc:
+        raise RuntimeError(f"OpenRouter error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Unified call dispatcher
+# ---------------------------------------------------------------------------
+
+def _call_llm(prompt: str, api_key: str = "", provider: str = "") -> str:
+    """
+    Route to the correct provider based on provider name.
+    provider can be: gemini, groq, ollama, openrouter
+    """
+    p = (provider or DEFAULT_PROVIDER).lower().strip()
+
+    print(f"[llm] Using provider={p}")
+
+    if p == "groq":
+        return _call_groq(prompt, api_key)
+    elif p == "ollama":
+        return _call_ollama(prompt)
+    elif p == "openrouter":
+        return _call_openrouter(prompt, api_key)
+    else:  # default: gemini
+        return _call_gemini(prompt, api_key)
+
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+def _trim(text: str, limit: int = MAX_DOC_CHARS) -> str:
+    """Keep first 65% + last 35% to stay within token budget."""
+    if len(text) <= limit:
         return text
-    head = int(max_chars * 0.6)
-    tail = max_chars - head
-    trimmed = text[:head] + "\n\n[... content trimmed for length ...]\n\n" + text[-tail:]
-    print(f"[ai_processor] ℹ️  Text trimmed from {len(text)} to {len(trimmed)} chars")
-    return trimmed
+    head = int(limit * 0.65)
+    tail = limit - head
+    return text[:head] + "\n[...]\n" + text[-tail:]
 
 
-def _extract_json(text: str) -> dict:
-    """
-    Robustly extract a JSON object from an LLM response.
-    Handles markdown fences, leading/trailing noise, and partial outputs.
-    """
-    if not text:
+def _parse_json(raw: str) -> dict:
+    """Robustly extract JSON from LLM response."""
+    if not raw:
         return {"parse_error": True, "raw": ""}
 
-    # 1. Try to strip ```json ... ``` fences
-    fence_match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
-    if fence_match:
-        candidate = fence_match.group(1).strip()
-    else:
-        # 2. Find the first { ... } block
-        brace_match = re.search(r"\{[\s\S]+\}", text)
-        candidate = brace_match.group(0).strip() if brace_match else text.strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw)
+    candidate = m.group(1) if m else raw
 
-    # 3. Strip stray backticks
-    candidate = candidate.lstrip("`").rstrip("`").strip()
+    if not candidate.strip().startswith("{"):
+        m2 = re.search(r"\{[\s\S]+\}", candidate)
+        candidate = m2.group(0) if m2 else candidate
+
+    candidate = candidate.strip().lstrip("`").rstrip("`").strip()
 
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
-        # 4. Last resort: try to fix common LLM JSON issues (trailing commas)
         fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
         try:
             return json.loads(fixed)
         except json.JSONDecodeError as e:
-            print(f"[ai_processor] ⚠️  JSON parse failed: {e}")
-            return {"parse_error": True, "raw": text[:600]}
+            print(f"[llm] JSON parse failed: {e} | first 300: {candidate[:300]}")
+            return {"parse_error": True, "raw": raw[:600]}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PHASE 1a — Inspect Report Extraction
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# DDR prompt
+# ---------------------------------------------------------------------------
 
-INSPECTION_EXTRACTION_PROMPT = """\
-You are an expert building inspection analyst. Read the following raw text from a SITE INSPECTION REPORT.
+_DDR_PROMPT = """\
+You are a senior building diagnostics expert writing a Detailed Diagnostic Report (DDR).
 
-RULES:
-1. Do NOT invent or assume any fact not in the text.
-2. Use the exact string "Not Available" for any missing field.
-3. Return ONLY a valid raw JSON object — no markdown, no explanation.
+You are given two raw document texts:
+1. SITE INSPECTION REPORT
+2. THERMAL IMAGING REPORT
 
-DOCUMENT TEXT:
-{text}
+STRICT RULES:
+- Do NOT invent any fact. Only use information present in the documents.
+- If a field is missing: write exactly "Not Available".
+- If sources conflict: note the conflict explicitly.
+- No duplicate observations. Merge related points into one.
+- Plain English only. No technical jargon. Client-friendly language.
+- Severity: Critical / High / Moderate / Low (evidence-based only).
+- Output ONLY a single raw JSON object. No markdown. No explanation.
 
-Return exactly this JSON structure:
-{{
-  "property_info": {{
-    "property_type": "...",
-    "address": "...",
-    "floors": "...",
-    "property_age": "...",
-    "inspection_date": "...",
-    "inspected_by": "...",
-    "previous_audit": "...",
-    "previous_repairs": "..."
-  }},
-  "impacted_areas": [
-    {{
-      "area_id": "1",
-      "area_name": "Area name",
-      "negative_side_description": "Problem side observations",
-      "positive_side_description": "Source side observations",
-      "photo_references": ["Photo 1"],
-      "checklist_findings": {{
-        "leakage_type": "...",
-        "concealed_plumbing": "...",
-        "tile_issues": "...",
-        "other": "..."
-      }}
-    }}
-  ],
-  "summary_table": [
-    {{
-      "point_no": "1",
-      "impacted_area_description": "...",
-      "exposed_area_description": "..."
-    }}
-  ],
-  "general_checklist": {{
-    "rcc_condition": "...",
-    "external_wall_condition": "...",
-    "plumbing_issues": "...",
-    "paint_condition": "..."
-  }},
-  "missing_info": ["list any incomplete or unclear information"]
-}}
-"""
+=== SITE INSPECTION REPORT ===
+{inspection_text}
 
+=== THERMAL IMAGING REPORT ===
+{thermal_text}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PHASE 1b — Thermal Report Extraction
-# ──────────────────────────────────────────────────────────────────────────────
-
-THERMAL_EXTRACTION_PROMPT = """\
-You are a thermal imaging expert. Read the following raw text from a THERMAL INSPECTION REPORT.
-
-RULES:
-1. Do NOT invent any fact.
-2. Use "Not Available" for any missing field.
-3. Return ONLY a valid raw JSON object — no markdown, no explanation.
-
-DOCUMENT TEXT:
-{text}
-
-Return exactly this JSON structure:
-{{
-  "device_info": {{
-    "device": "...",
-    "serial_number": "...",
-    "emissivity": "...",
-    "reflected_temperature": "..."
-  }},
-  "inspection_date": "...",
-  "thermal_scans": [
-    {{
-      "scan_no": 1,
-      "image_filename": "...",
-      "hotspot_temp": "28.8 °C",
-      "coldspot_temp": "23.4 °C",
-      "delta_temp": "5.4 °C",
-      "area_reference": "Hall / Room name if mentioned",
-      "significance": "High delta indicates active moisture"
-    }}
-  ],
-  "temperature_summary": {{
-    "max_hotspot": "...",
-    "min_coldspot": "...",
-    "average_delta": "...",
-    "high_concern_scans": ["scan numbers with delta > 4°C"]
-  }},
-  "missing_info": ["any unclear information"]
-}}
-"""
-
-
-def extract_inspection_data(full_text: str) -> dict[str, Any]:
-    """Extract structured data from the inspection report text."""
-    trimmed = _trim_text(full_text, MAX_TEXT_CHARS)
-    prompt = INSPECTION_EXTRACTION_PROMPT.format(text=trimmed)
-    response = _call_llm(prompt)
-    return _extract_json(response)
-
-
-def extract_thermal_data(full_text: str) -> dict[str, Any]:
-    """Extract structured data from the thermal report text."""
-    trimmed = _trim_text(full_text, MAX_TEXT_CHARS)
-    prompt = THERMAL_EXTRACTION_PROMPT.format(text=trimmed)
-    response = _call_llm(prompt)
-    return _extract_json(response)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# PHASE 2 — Merge & Generate DDR
-# ──────────────────────────────────────────────────────────────────────────────
-
-DDR_MERGE_PROMPT = """\
-You are a senior building diagnostics expert writing a professional Detailed Diagnostic Report (DDR) for a client.
-
-You have two structured data sources below. Merge them into a unified DDR.
-
-RULES:
-1. Do NOT invent any facts. Only use information from the provided data.
-2. Where information is missing, write exactly: "Not Available"
-3. If two sources contradict each other, note the conflict explicitly.
-4. Combine duplicate observations — do NOT repeat the same point twice.
-5. Use plain, client-friendly English. No excessive jargon.
-6. Assign severity: Critical / High / Moderate / Low — based only on evidence.
-7. Return ONLY a valid raw JSON object — no markdown, no explanation.
-
-=== INSPECTION REPORT DATA ===
-{inspection_json}
-
-=== THERMAL REPORT DATA ===
-{thermal_json}
-
-Return exactly this JSON structure:
+Return this JSON structure (fill ALL fields):
 {{
   "report_metadata": {{
-    "property_type": "...",
-    "address": "...",
-    "inspection_date": "...",
-    "inspected_by": "...",
+    "property_type": "",
+    "address": "",
+    "inspection_date": "",
+    "inspected_by": "",
     "report_generated_by": "AI DDR System",
-    "floors": "...",
-    "property_age": "...",
-    "previous_audit": "...",
-    "previous_repairs": "..."
+    "floors": "",
+    "property_age": "",
+    "previous_audit": "",
+    "previous_repairs": ""
   }},
-  "property_issue_summary": "3-5 sentence plain-English executive summary for a non-technical client.",
+  "property_issue_summary": "3-5 plain English sentences summarising ALL findings for a non-technical client.",
   "area_observations": [
     {{
-      "area_name": "Hall",
+      "area_name": "e.g. Hall / Kitchen / Bathroom",
       "area_id": "1",
-      "observations": [
-        "Dampness observed at skirting level",
-        "Paint peeling along the lower wall section"
-      ],
+      "observations": ["Specific observation 1", "Specific observation 2"],
       "thermal_findings": {{
-        "scan_nos": ["1", "2"],
-        "hotspot_temp": "28.8 °C",
-        "coldspot_temp": "23.4 °C",
-        "delta_temp": "5.4 °C",
-        "interpretation": "Temperature gradient of 5.4°C indicates active moisture migration from adjacent bathroom"
+        "scan_nos": ["1"],
+        "hotspot_temp": "e.g. 28.8 degC",
+        "coldspot_temp": "e.g. 23.4 degC",
+        "delta_temp": "e.g. 5.4 degC",
+        "interpretation": "Plain English meaning of the temperature difference"
       }},
-      "image_refs": ["photo_1", "photo_2"],
-      "thermal_image_refs": ["scan_1", "scan_2"],
-      "probable_root_cause": "Plain-English explanation of the most likely cause",
+      "image_refs": [],
+      "thermal_image_refs": [],
+      "probable_root_cause": "Most likely cause in plain English",
       "severity": "High",
-      "severity_reasoning": "Reasoning for the severity level assigned",
-      "recommended_actions": [
-        "Action step 1",
-        "Action step 2"
-      ]
+      "severity_reasoning": "Why this severity level was chosen",
+      "recommended_actions": ["Specific action step 1", "Specific action step 2"]
     }}
   ],
   "overall_severity_assessment": {{
     "overall_level": "High",
-    "reasoning": "Overall reasoning for the property-wide severity level",
-    "urgent_areas": ["Hall", "Parking Area"]
+    "reasoning": "Overall reasoning for property-wide severity",
+    "urgent_areas": ["Hall", "Parking"]
   }},
-  "additional_notes": "Any additional context or observations from the documents",
-  "missing_or_unclear_info": [
-    "Not Available: Property age not mentioned in inspection report"
-  ],
-  "conflicts_detected": [
-    "No conflicts detected between sources"
-  ]
+  "additional_notes": "Any extra relevant context from the documents",
+  "missing_or_unclear_info": ["Not Available: describe what is missing"],
+  "conflicts_detected": ["No conflicts detected"]
 }}
 """
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def generate_ddr_direct(
+    inspection_text: str,
+    thermal_text: str,
+    api_key: str = "",
+    provider: str = "",
+) -> dict[str, Any]:
+    """
+    ONE LLM call -> complete DDR JSON.
+    api_key and provider passed explicitly (thread-safe).
+    """
+    prompt = _DDR_PROMPT.format(
+        inspection_text=_trim(inspection_text),
+        thermal_text=_trim(thermal_text),
+    )
+    return _parse_json(_call_llm(prompt, api_key=api_key, provider=provider))
+
+
+# Backward-compatible shims
+def extract_inspection_data(full_text: str) -> dict[str, Any]:
+    return {"_raw_text": _trim(full_text)}
+
+def extract_thermal_data(full_text: str) -> dict[str, Any]:
+    return {"_raw_text": _trim(full_text)}
+
 def generate_ddr_json(
     inspection_data: dict[str, Any],
     thermal_data: dict[str, Any],
+    api_key: str = "",
+    provider: str = "",
 ) -> dict[str, Any]:
-    """Merge inspection + thermal data and generate the full DDR JSON."""
-
-    # Serialize structured data — keep compact to save tokens
-    insp_json = json.dumps(inspection_data, indent=None, ensure_ascii=False)
-    therm_json = json.dumps(thermal_data, indent=None, ensure_ascii=False)
-
-    # Trim if the structured JSONs themselves are very large
-    insp_json = _trim_text(insp_json, 5_000)
-    therm_json = _trim_text(therm_json, 4_000)
-
-    prompt = DDR_MERGE_PROMPT.format(
-        inspection_json=insp_json,
-        thermal_json=therm_json,
-    )
-    response = _call_llm(prompt)
-    return _extract_json(response)
+    insp_text  = inspection_data.get("_raw_text", json.dumps(inspection_data)[:MAX_DOC_CHARS])
+    therm_text = thermal_data.get("_raw_text",    json.dumps(thermal_data)[:MAX_DOC_CHARS])
+    return generate_ddr_direct(insp_text, therm_text, api_key=api_key, provider=provider)

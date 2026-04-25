@@ -32,26 +32,18 @@ PDF Extraction (PyMuPDF — < 1 second)
 • Clean text (remove headers, page numbers, boilerplate)
         │
         ▼
-AI Extraction — Phase 1 (Gemini)
-• Inspection Report → structured JSON
-  {property info, impacted areas, checklist, severity hints}
-• Thermal Report → structured JSON
-  {device info, per-scan hotspot/coldspot/delta temps}
-        │
-        ▼
-AI Merge — Phase 2 (Gemini)
+AI Extraction & Merging (Groq / Gemini / Ollama / OpenRouter)
+• Analyze Inspection Report → structured JSON
+• Analyze Thermal Report → structured JSON
 • Combine both JSONs into unified DDR
-• Deduplicate overlapping observations
-• Flag conflicts between sources
-• Mark missing data as "Not Available"
-• Assign severity per area (Critical/High/Moderate/Low)
+• Deduplicate overlapping observations, flag conflicts, and assign severity
 • Generate plain-English recommendations
         │
         ▼
-Report Assembly
-• Assign inspection photos → relevant area sections
-• Assign thermal scans → relevant area sections
+Report Assembly & PDF Generation
+• Assign inspection photos & thermal scans → relevant area sections
 • Render professional HTML report (Jinja2 template)
+• Generate Pixel-Perfect PDF via headless browser (Playwright)
 • Available as: live preview | HTML download | PDF download
 ```
 
@@ -78,34 +70,26 @@ Report Assembly
 ```bash
 cd backend
 pip install -r requirements.txt
+playwright install chromium
 ```
 
-### 2. Set Up Your Gemini API Key
-
-Get a **free key** at [aistudio.google.com](https://aistudio.google.com/apikey)
-
-**Option A — `.env` file (recommended):**
-```bash
-# Edit backend/.env
-GEMINI_API_KEY=your_real_key_here
-```
-
-**Option B — Enter in the UI** (no file needed — just paste in the web form)
-
-### 3. Run the Server
+### 2. Run the Server
 
 ```bash
 cd backend
-python -m uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8096
 ```
 
-### 4. Open the App
+### 3. Open the App & Configure AI
 
 ```
-http://localhost:8000
+http://localhost:8096
 ```
 
-Upload your **Inspection Report PDF** + **Thermal Report PDF** → Click **Generate DDR Report** → Download!
+1. Select your preferred **AI Provider** from the dropdown (`Groq`, `Gemini`, `Ollama`, or `OpenRouter`).
+2. Paste your free API key into the UI (No `.env` configuration required!).
+3. Upload your **Inspection Report PDF** + **Thermal Report PDF**.
+4. Click **Generate DDR Report** → Download your pixel-perfect PDF!
 
 ---
 
@@ -216,9 +200,9 @@ git push origin main
 |---|---|
 | Backend | Python 3.11+, FastAPI, Uvicorn |
 | PDF Parsing | PyMuPDF (fitz) |
-| AI / LLM | Google Gemini (via google-genai SDK) |
+| AI / LLM Pipeline | Groq (Llama 3), Google Gemini, Ollama, OpenRouter |
 | Templating | Jinja2 |
-| PDF Export | xhtml2pdf |
+| PDF Export | Playwright (Headless Chromium) |
 | Frontend | HTML5, Vanilla CSS, Vanilla JavaScript |
 | Deployment | Docker → Railway / Render |
 

@@ -54,10 +54,43 @@ function setFile(file, type) {
 }
 
 function checkReadyState() {
+  const provider = document.getElementById("provider-select").value;
   const apiKey = document.getElementById("api-key-input").value.trim();
   const btn = document.getElementById("generate-btn");
-  btn.disabled = !(inspectionFile && thermalFile && apiKey.length > 10);
+  // Ollama doesn't need a key
+  const keyOk = provider === "ollama" || apiKey.length > 6;
+  btn.disabled = !(inspectionFile && thermalFile && keyOk);
 }
+
+// ── Provider selector logic ────────────────────────────────────────────────
+
+const PROVIDER_META = {
+  groq:        { label: "Groq API Key",       placeholder: "gsk_...",    link: "https://console.groq.com",         linkText: "console.groq.com (free)" },
+  gemini:      { label: "Gemini API Key",     placeholder: "AIza...",    link: "https://aistudio.google.com/apikey",linkText: "aistudio.google.com (free)" },
+  ollama:      { label: "",                   placeholder: "",           link: "",                                  linkText: "" },
+  openrouter:  { label: "OpenRouter API Key", placeholder: "sk-or-...",  link: "https://openrouter.ai/keys",       linkText: "openrouter.ai (free credits)" },
+};
+
+function onProviderChange() {
+  const provider = document.getElementById("provider-select").value;
+  const meta = PROVIDER_META[provider] || PROVIDER_META.groq;
+  const keyWrap = document.getElementById("api-key-wrap");
+  const ollamaHint = document.getElementById("ollama-hint");
+
+  if (provider === "ollama") {
+    keyWrap.style.display = "none";
+    ollamaHint.style.display = "block";
+  } else {
+    keyWrap.style.display = "";
+    ollamaHint.style.display = "none";
+    document.getElementById("api-key-label").textContent = meta.label;
+    document.getElementById("api-key-input").placeholder = meta.placeholder;
+  }
+  checkReadyState();
+}
+
+document.getElementById("provider-select").addEventListener("change", onProviderChange);
+onProviderChange(); // init on page load
 
 // Listen for API key input
 document.getElementById("api-key-input").addEventListener("input", checkReadyState);
@@ -72,14 +105,13 @@ document.getElementById("upload-form").addEventListener("submit", async (e) => {
     return;
   }
 
-  const apiKey = document.getElementById("api-key-input").value.trim();
-  if (!apiKey || apiKey.length < 10) {
-    alert("Please enter your Gemini API key.");
+  const provider = document.getElementById("provider-select").value;
+  const apiKey   = document.getElementById("api-key-input").value.trim();
+
+  if (provider !== "ollama" && (!apiKey || apiKey.length < 6)) {
+    alert("Please enter your API key for the selected provider.");
     return;
   }
-
-  // Store API key for this session (sent via custom header)
-  sessionStorage.setItem("gemini_api_key", apiKey);
 
   showProgress();
 
@@ -87,10 +119,13 @@ document.getElementById("upload-form").addEventListener("submit", async (e) => {
   formData.append("inspection_report", inspectionFile);
   formData.append("thermal_report", thermalFile);
 
+  const headers = { "X-AI-Provider": provider };
+  if (apiKey) headers["X-Api-Key"] = apiKey;
+
   try {
     const res = await fetch(`${API_BASE}/generate`, {
       method: "POST",
-      headers: { "X-Gemini-Key": apiKey },
+      headers,
       body: formData,
     });
 
@@ -192,22 +227,22 @@ function showError(message) {
   document.getElementById("upload-card").style.display = "block";
   document.getElementById("error-card").style.display = "block";
 
-  const isQuota = message.includes("quota") || message.includes("QUOTA") || message.includes("429") || message.includes("RESOURCE_EXHAUSTED");
+  // Detect quota / rate-limit errors and show extra help
+  const isQuota = message.includes("429") || message.includes("RESOURCE_EXHAUSTED") ||
+                  message.includes("quota") || message.includes("exhausted");
 
   if (isQuota) {
-    document.getElementById("error-msg").innerHTML = `
-      <strong>Gemini API quota exhausted.</strong><br/>
-      The free tier has daily request limits. Here’s what you can do:<br/><br/>
-      <span style="color:#94a3b8">
-        1️⃣ Wait a few minutes and try again (per-minute limit)<br/>
-        2️⃣ Wait until midnight (Pacific Time) for daily quota reset<br/>
-        3️⃣ Use a paid Gemini API key — <a href="https://aistudio.google.com/" target="_blank" style="color:#60a5fa">Get one here ↗</a>
-      </span>
-    `;
+    document.getElementById("error-title").textContent = "Quota Limit Reached";
+    document.getElementById("error-msg").textContent =
+      "All Gemini models hit their free-tier quota. The system tried gemini-2.0-flash → gemini-1.5-flash → gemini-1.5-pro automatically.";
+    document.getElementById("error-quota-help").style.display = "block";
   } else {
+    document.getElementById("error-title").textContent = "Generation Failed";
     document.getElementById("error-msg").textContent = message;
+    document.getElementById("error-quota-help").style.display = "none";
   }
 }
+
 
 // ── Reset ──────────────────────────────────────────────────────────────────
 
