@@ -521,7 +521,7 @@
           <div class="image-gallery">
             {% for img in area.assigned_images[:6] %}
             <div class="image-card">
-              <img src="{{ img.data_uri }}" alt="Inspection photo {{ loop.index }}" loading="lazy"/>
+              <img src="{{ img.data_uri }}" alt="Inspection photo {{ loop.index }}"/>
               <div class="image-card-label">Site Photo {{ loop.index }}</div>
             </div>
             {% endfor %}
@@ -560,7 +560,7 @@
             <div class="image-gallery">
               {% for img in area.assigned_thermal_images[:4] %}
               <div class="image-card" style="border-color: #bfdbfe; background: #eff6ff;">
-                <img src="{{ img.data_uri }}" alt="Thermal scan {{ loop.index }}" loading="lazy"/>
+                <img src="{{ img.data_uri }}" alt="Thermal scan {{ loop.index }}"/>
                 <div class="image-card-label" style="color:#3b82f6;">Thermal Scan {{ loop.index }}</div>
               </div>
               {% endfor %}
