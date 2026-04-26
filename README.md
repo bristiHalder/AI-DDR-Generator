@@ -8,16 +8,12 @@ Built for the **Applied AI Builder** assignment evaluation.
 
 ## 🚀 Live Demo
 
-> **[➜ Click to open the live app](http://localhost:8000)**  
-> *(Replace with your deployed URL)*
-
+> **[➜ Click to open the live app](https://ai-ddr-generator-fga6.onrender.com/)**  
 ---
 
 ## 🎬 Demo Video
 
-> **[➜ Watch the Loom walkthrough](#)**  
-> *(3–5 min: what it does, how it works, limitations, improvements)*
-
+ **[➜ Watch the Loom walkthrough](https://www.loom.com/share/ad43414e4d1f4a48b7d760cf038ca965)**  
 ---
 
 ## 🧠 How It Works
