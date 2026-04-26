@@ -296,7 +296,7 @@ async def download_html(job_id: str):
 
 
 @app.get("/download/{job_id}/pdf")
-async def download_pdf(job_id: str):
+def download_pdf(job_id: str):
     """Download the generated DDR as a PDF file."""
     html_path = OUTPUTS_DIR / f"{job_id}.html"
     pdf_path = OUTPUTS_DIR / f"{job_id}.pdf"
@@ -306,17 +306,17 @@ async def download_pdf(job_id: str):
 
     # Convert HTML → PDF using Playwright (pixel-perfect modern CSS rendering)
     try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
             
             # Load the local HTML file into the headless browser
             file_url = f"file:///{html_path.resolve().as_posix()}"
-            await page.goto(file_url, wait_until="networkidle")
+            page.goto(file_url, wait_until="networkidle")
             
             # Wait for base64 images to be fully decoded and painted by the browser
-            await page.evaluate('''
+            page.evaluate('''
                 async () => {
                     const images = Array.from(document.images);
                     await Promise.all(images.map(img => {
@@ -325,10 +325,10 @@ async def download_pdf(job_id: str):
                     }));
                 }
             ''')
-            await page.wait_for_timeout(2000) # Give Chromium 2 seconds to paint the layout
+            page.wait_for_timeout(2000) # Give Chromium 2 seconds to paint the layout
             
             # Generate a gorgeous, styled PDF
-            await page.pdf(
+            page.pdf(
                 path=str(pdf_path),
                 format="A4",
                 print_background=True,
@@ -336,7 +336,10 @@ async def download_pdf(job_id: str):
             )
             await browser.close()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF conversion failed: {e}")
+        import traceback
+        err_msg = traceback.format_exc()
+        print(err_msg)
+        raise HTTPException(status_code=500, detail=f"PDF conversion failed: {str(e)}\n\nTraceback: {err_msg}")
 
     return FileResponse(
         path=str(pdf_path),
