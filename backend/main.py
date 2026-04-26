@@ -315,6 +315,18 @@ async def download_pdf(job_id: str):
             file_url = f"file:///{html_path.resolve().as_posix()}"
             await page.goto(file_url, wait_until="networkidle")
             
+            # Wait for base64 images to be fully decoded and painted by the browser
+            await page.evaluate('''
+                async () => {
+                    const images = Array.from(document.images);
+                    await Promise.all(images.map(img => {
+                        if (img.complete) return Promise.resolve();
+                        return new Promise(resolve => { img.onload = resolve; img.onerror = resolve; });
+                    }));
+                }
+            ''')
+            await page.wait_for_timeout(2000) # Give Chromium 2 seconds to paint the layout
+            
             # Generate a gorgeous, styled PDF
             await page.pdf(
                 path=str(pdf_path),
